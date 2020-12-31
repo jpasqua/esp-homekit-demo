@@ -1,4 +1,4 @@
-PROGRAM = button
+PROGRAM = JPbutton
 
 EXTRA_COMPONENTS = \
 	extras/http-parser \
@@ -26,4 +26,4 @@ monitor:
 QRTOOL = $(abspath ../../components/common/homekit/tools/gen_qrcode)
 .PHONY: qrcode
 qrcode:
-	$(QRTOOL) $(CAT_ID) "$(DEV_PASS)" "$(DEV_SETUP)" $(DEV_NAME).png
+	$(QRTOOL) $(CAT_ID) "$(DEV_PASS)" "$(DEV_SETUP)" artifacts/$(DEV_NAME).png

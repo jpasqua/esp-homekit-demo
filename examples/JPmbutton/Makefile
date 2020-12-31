@@ -1,4 +1,4 @@
-PROGRAM = button
+PROGRAM = JPmbutton
 
 EXTRA_COMPONENTS = \
 	extras/http-parser \
