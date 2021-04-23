@@ -4,89 +4,103 @@
 //     
 //
 // Notes:
-// o Each STATELESS_PROGRAMMABLE_SWITCH has two physical buttons: 
-//   one for ON and the other for OFF
+// o Acts as multiple Programmable Switches in a single unit
+// o One button per programmable device
 // o Presses result in the following Homekit actions:
-//   + ON Button
-//     - Single press: "Single Press"
-//     - Double press: NONE
-//     - Long press:   "Triple Press"
-//   + OFF Button
-//     - Single press: "Double Press"
-//     - Double press: NONE
-//     - Long press:   NONE, but triggers reset of device
-// o Thus to use this device to trigger an on/off action in Homekit, map
+//   - Single press: Generates a HomeKit "Single Press" event
+//   - Long press:   Generates a HomeKit "Double Press" event
+//   - Double press: Part of a reset sequence - see below
+//   - Triple press: Generates a HomeKit "Triple Press" event
+// o Why not just use "double press" directly rather than a long press? Because unlike lights,
+//   it is a big deal to accidentally turn off some devices (e.g. a 3D printer plugged into a
+//   controllable outlet). I wanted the off gesture to be very intentional
+// o To use this device to trigger an on/off action in Homekit, map
 //   + Single press to ON  for the device under control (e.g. light, outlet, etc.)
 //   + Double press to Off for the device under control (e.g. light, outlet, etc.)
 //   + Triple Press to any other desired scene
+// o Reseting the device: To remove pairings and wifi configuration, the device can be reset
+//   using a sequence of double presses on any button. At the moment, (3) double-presses in
+//   a row are required with no intervening button presses.
+// o User Feedback
+//   + Power on, but not connected to wifi yet: Steady gray color
+//   + Device needs to be configured via wifi: A repeating pattern of 4 short orange pulses
+//   + Connected to wifi and ready to go: 5 short green pulses
+//   + Single Button Press: 1 long green pulse
+//   + Long Button Press: 2 medium red pulses
+//   + Triple Button Press: 3 shorter blue pulses
+//   + Double Button Press: 1 shorter gray pulse
+//   + Error (unreconized button press): 5 short yellow pulses
+//   + Device Identification triggered from App: 3 short purple pulses repeated 3 times
+//   + TYPICAL STARTUP SEQUENCE
+//     - LED illuminates steady gray to indicate power is on and the device is initializing
+//     - 5 short green pulses and then LED off indicating it is connected to wifi and ready to go
+//     - [User presses a button once] 1 long green pulse and then off
+//   + FIRST TIME STARTUP SEQUENCE
+//     - LED illuminates steady gray to indicate power is on and the device is initializing
+//     - A repeating pattern of 4 short orange pulses.
+//     - [User configures via WiFi] 5 short green pulses and then LED off - device is ready
+//     - [User presses a button once] 1 long green pulse and then off
 //
+// Building:
+// o Sample make command:
+//   make -C examples/button all -DDEV_PASS="123-45-678" -DDEV_SERIAL="1200345" -DDEV_SETUP="J81Q"
+// o Generating a qrcode
+//   esp-homekit-demo/components/common/homekit/tools/gen_qrcode 15 123-45-678 J81Q qrcode.png
 //
 
-
+// ----- Standard C
+#include <string.h>
 #include <stdio.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <espressif/esp_system.h>
+#include <stdlib.h>
+// ----- Espressif
 #include <espressif/esp_wifi.h>
-#include <esp/uart.h>
-#include <esp8266.h>
-#include <FreeRTOS.h>
-#include <task.h>
-
+// ----- HomeKit
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
+// ----- Third Party
 #include <wifi_config.h>
+// ----- esp-homekit-demo
 #include <button.h>
+// ----- App-specific
+#include "utils.h"
 
 
 /*------------------------------------------------------------------------------
  *
- * Constants
+ * Sanity Check
  *
  *----------------------------------------------------------------------------*/
 
-#define Q(x) #x
-#define QUOTE(x) Q(x)
-
-#ifndef DEV_SERIAL
-    #define DEV_SERIAL "0012345"
-#endif
-#ifndef DEV_PASS
-    #define DEV_PASS "111-11-111"
-#endif
-#ifndef DEV_SETUP
-    #define DEV_SETUP "1QJ8"
+#if !defined(DEV_SERIAL) || !defined(DEV_PASS) || !defined(DEV_SETUP)
+    #error The following must be defined: DEV_SERIAL, DEV_PASS, DEV_SETUP
 #endif
 
-char DeviceModel[]    = "MultiB";
-char DeviceSetupID[]  = QUOTE(DEV_SETUP);
-char DevicePassword[] = QUOTE(DEV_PASS);
-char DeviceSerial[]   = QUOTE(DEV_SERIAL);
-char DeviceName[]     = QUOTE(DEV_NAME);
 
 /*------------------------------------------------------------------------------
  *
- * HW Configuration
+ * General Configuration
  *
  *----------------------------------------------------------------------------*/
+
+#define NButtons (4)
+
+struct {
+  uint8_t pin;
+  char name[4];
+  homekit_characteristic_t* event;
+} buttonInfo[NButtons] = {
+  {  2 /*D4*/, "B01", NULL },
+  {  4 /*D2*/, "B02", NULL },
+  {  5 /*D1*/, "B03", NULL },
+  { 14 /*D5*/, "B04", NULL }
+};
 
 static const uint8_t Pin_LED = 15;  // D1 Mini: D8
 
-#define NButtonPairs (4)
+static const uint8_t ResetSequenceThreshold = 2;
+  // Determines how many double-presses of a button are required to trigger a reset
 
-typedef struct {
-  uint8_t onPin;
-  uint8_t offPin;
-} ButtonPair;
-
-ButtonPair button[NButtonPairs] = {
-  { 0,  2}, // D1 Mini: D3, D4
-  { 4,  5}, // D1 Mini: D2, D1
-  {12, 13}, // D1 Mini: D6, D7
-  {14, 16}  // D1 Mini: D5, D0
-};
-char* accessoryNames[NButtonPairs];
-
+static const uint32_t LongPressTime = 4000;
 
 /*------------------------------------------------------------------------------
  *
@@ -94,208 +108,84 @@ char* accessoryNames[NButtonPairs];
  *
  *----------------------------------------------------------------------------*/
 
-void homekitEventHandler(homekit_event_t event);
+char DeviceModel[]    = "MultiB";
 
 homekit_accessory_t *accessories[2];  // List w/ 1 accessory & NULL termination
 homekit_server_config_t config = {
     .accessories = accessories,
-    .password = DevicePassword,
-    .setupId = DeviceSetupID,
+    .password = QUOTE(DEV_PASS),
+    .setupId = QUOTE(DEV_SETUP),
     .on_event = homekitEventHandler
 };
-homekit_characteristic_t* buttonEvent[NButtonPairs];
-
-/*------------------------------------------------------------------------------
- *
- * Utility functions
- *
- *----------------------------------------------------------------------------*/
-
-// ----- General Utlitities -----
-void delayMS(uint32_t delayMillis) { vTaskDelay(delayMillis / portTICK_PERIOD_MS); }
-
-// ----- LED-related -----
-void setLED(bool on) { gpio_write(Pin_LED, on ? 0 : 1); }
-
-void blinkIt(uint8_t cycles, uint32_t delayMillis) {
-  for (int i  = 0; i < cycles; i++) {
-    setLED(true);
-    delayMS(delayMillis);
-    setLED(false);
-    delayMS(delayMillis);
-  }
-}
-
-void identifyDeviceTask(void *_args) {
-  for (int i = 0; i < 3; i++) {
-    blinkIt(3, 100);
-    delayMS(250);
-  }
-  setLED(false);
-
-  vTaskDelete(NULL);
-}
-
-void identifyDevice(homekit_value_t _value) {
-  printf("LED identify\n");
-  xTaskCreate(identifyDeviceTask, "Identify Device", 128, NULL, 2, NULL);
-}
-
-void indicateStationModeTask(void *_args) {
-  while (true) {
-    blinkIt(4, 125);
-    delayMS(1000);
-  }
-}
-
-void indicateStationMode(bool on) {
-  static TaskHandle_t xHandle = NULL;
-  if (on) {
-    xTaskCreate(indicateStationModeTask, "StationMode", 128, NULL, 2, &xHandle);
-  } else {
-    if (xHandle != NULL) {
-       vTaskDelete(xHandle);
-    }
-    setLED(false);
-  }
-}
-
-void prepLED() {
-  gpio_enable(Pin_LED, GPIO_OUTPUT);
-  setLED(false);
-}
-
-// ----- Reset Handling -----
-void resetConfigTask() {
-  // Flash the LED first before we start the reset
-  blinkIt(5, 100);
-
-  printf("Resetting Wifi Config\n");
-  wifi_config_reset();
-  delayMS(1000);
-
-  printf("Resetting HomeKit Config\n");
-  homekit_server_reset();
-  delayMS(1000);
-
-  printf("Restarting\n");
-  sdk_system_restart();
-  vTaskDelete(NULL);
-}
-
-void resetConfig() {
-  printf("Resetting configuration\n");
-  xTaskCreate(resetConfigTask, "Reset configuration", 256, NULL, 2, NULL);
-}
 
 
 /*------------------------------------------------------------------------------
  *
- * Button Handling
+ * Callback Handlers
  *
  *----------------------------------------------------------------------------*/
 
-homekit_characteristic_t button_event = HOMEKIT_CHARACTERISTIC_(PROGRAMMABLE_SWITCH_EVENT, 0);
-
-void onButtonCallback(button_event_t event, void *context) {
+void buttonCallback(button_event_t event, void *context) {
+  static uint8_t resetSequenceCount = 0;
   homekit_characteristic_t* button = (homekit_characteristic_t*)context;
   if (event == button_event_single_press) {
-    printf("single press of on button\n");
-    homekit_characteristic_notify(button, HOMEKIT_UINT8(0));
-    blinkIt(1, 50);
+      blinkInBackground(LED_GREEN, 1, 600);
+      printf("single press of on button\n");
+      resetSequenceCount = 0;
+      homekit_characteristic_notify(button, HOMEKIT_UINT8(0));
   } else if (event == button_event_long_press) {
-    printf("long press of on button\n");
-    homekit_characteristic_notify(button, HOMEKIT_UINT8(2));
-    blinkIt(2, 75);
+      blinkInBackground(LED_RED, 2, 300);
+      printf("long press of on button\n");
+      resetSequenceCount = 0;
+      homekit_characteristic_notify(button, HOMEKIT_UINT8(1));
+  } else if (event == button_event_tripple_press) {
+      blinkInBackground(LED_BLUE, 3, 200);
+      printf("triple press of on button\n");
+      resetSequenceCount = 0;
+      homekit_characteristic_notify(button, HOMEKIT_UINT8(2));
+  } else if (event == button_event_double_press) {
+      blinkInBackground(LED_GRAY, 1, 200);
+      printf("double press of on button\n");
+      resetSequenceCount++;
+      if (resetSequenceCount == ResetSequenceThreshold) {
+        resetConfig();
+      }
   } else {
-    printf("Unused button event: %d\n", event);        
-  }
-}
-
-void offButtonCallback(button_event_t event, void *context) {
-  homekit_characteristic_t* button = (homekit_characteristic_t*)context;
-  if (event == button_event_single_press) {
-    printf("single press of off button\n");
-    homekit_characteristic_notify(button, HOMEKIT_UINT8(1));
-    blinkIt(3, 50);
-  } else if (event == button_event_long_press) {
-    resetConfig();
-  } else {
-    printf("Unused button event: %d\n", event);        
-  }
-}
-
-
-/*------------------------------------------------------------------------------
- *
- * Homekit Callbacks
- *
- *----------------------------------------------------------------------------*/
-
-void homekitEventHandler(homekit_event_t event) {
-  switch(event) {
-    case HOMEKIT_EVENT_SERVER_INITIALIZED:
-      printf("HOMEKIT_EVENT_SERVER_INITIALIZED\n");
-      break;
-    case HOMEKIT_EVENT_CLIENT_CONNECTED:
-      printf("HOMEKIT_EVENT_CLIENT_CONNECTED\n");
-      break;
-    case HOMEKIT_EVENT_CLIENT_VERIFIED:
-      printf("HOMEKIT_EVENT_CLIENT_VERIFIED\n");
-      break;
-    case HOMEKIT_EVENT_CLIENT_DISCONNECTED:
-      printf("HOMEKIT_EVENT_CLIENT_DISCONNECTED\n");
-      break;
-    case HOMEKIT_EVENT_PAIRING_ADDED:
-      printf("HOMEKIT_EVENT_PAIRING_ADDED\n");
-      break;
-    case HOMEKIT_EVENT_PAIRING_REMOVED:
-      printf("HOMEKIT_EVENT_PAIRING_REMOVED\n");
-      break;
-    default:
-      printf("Unknown event type: %d\n", event);
-      break;
+      blinkInBackground(LED_YELLOW, 5, 120);
+      resetSequenceCount = 0;
+      printf("Unused button event: %d\n", event);        
   }
 }
 
 void handleWiFiEvent(wifi_config_event_t event) {
-  switch (event) {
-    case WIFI_CONFIG_CONNECTED:
-      printf("Connected to WiFi\n");
-      homekit_server_init(&config);
-      break;
-    case WIFI_CONFIG_DISCONNECTED:
-      printf("Disconnected from WiFi\n");
-      break;
-    case WIFI_CONFIG_AP_START:
-      printf("Entering Station Mode\n");
-      indicateStationMode(true);
-      break;
-    case WIFI_CONFIG_AP_STOP:
-      printf("Leaving Station Mode\n");
-      indicateStationMode(false);
-      break;
-    default:
-      printf("Unknown event type: %d", event);
-      break;
+  logWiFiEvent(event);
+  if (event == WIFI_CONFIG_CONNECTED) {
+    blinkInBackground(LED_GREEN, 5, 200);
+    homekit_server_init(&config);
   }
 }
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Build the Accessory and Initialize
+ *
+ *----------------------------------------------------------------------------*/
 
 void buildAccessory() {
   uint8_t macaddr[6];
   sdk_wifi_get_macaddr(STATION_IF, macaddr);
 
-  int accNameLen = snprintf(
-    NULL, 0, "%s-%02X%02X%02X",
-    DeviceName, macaddr[3], macaddr[4], macaddr[5]);
-  char *accName = malloc(accNameLen+1);
-  snprintf(
-    accName, accNameLen+1, "%s-%02X%02X%02X",
-    DeviceName, macaddr[3], macaddr[4], macaddr[5]);
+  // Accessory name is of the form: DeviceModel-NNNNNN\0
+  char *accName = malloc(strlen(DeviceModel) + 7 + 1);
+  sprintf(
+    accName, "%s-%02X%02X%02X",
+    DeviceModel, macaddr[3], macaddr[4], macaddr[5]);
+  printf("Accessory Name = %s\n", accName);
 
-  homekit_service_t* services[1 + NButtonPairs + 1];
-    // 1 entry to for the accessory information
-    // NButtonPairs entriesf ro the button pairs
+  homekit_service_t* services[1 + NButtons + 1];
+    // 1 entry for the accessory information
+    // NButtons entries for the buttons
     // 1 entry for NULL termination of the list
   homekit_service_t** s = services;
 
@@ -304,7 +194,7 @@ void buildAccessory() {
     .characteristics=(homekit_characteristic_t*[]) {
       NEW_HOMEKIT_CHARACTERISTIC(NAME, accName),
       NEW_HOMEKIT_CHARACTERISTIC(MANUFACTURER, "BitsPlusAtoms"),
-      NEW_HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, DeviceSerial),
+      NEW_HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, QUOTE(DEV_SERIAL)),
       NEW_HOMEKIT_CHARACTERISTIC(MODEL, DeviceModel),
       NEW_HOMEKIT_CHARACTERISTIC(FIRMWARE_REVISION, "0.0.1"),
       NEW_HOMEKIT_CHARACTERISTIC(IDENTIFY, identifyDevice),
@@ -312,60 +202,43 @@ void buildAccessory() {
     }
   );
 
-  for (int i=0; i < NButtonPairs; i++) {
-    int buttonNameLen = snprintf(NULL, 0, "Button %d", i + 1);
-    char *buttonName = malloc(buttonNameLen+1);
-    snprintf(buttonName, buttonNameLen+1, "Button %d", i + 1);
-
-    buttonEvent[i] =
-      NEW_HOMEKIT_CHARACTERISTIC(PROGRAMMABLE_SWITCH_EVENT, i);
-
+  for (int i = 0; i < NButtons; i++) {
     *(s++) = NEW_HOMEKIT_SERVICE(
       STATELESS_PROGRAMMABLE_SWITCH,
       .primary=(i == 0) ? true : false,
       .characteristics=(homekit_characteristic_t*[]){
-        HOMEKIT_CHARACTERISTIC(NAME, buttonName),
-        buttonEvent[i],
+        (buttonInfo[i].event = NEW_HOMEKIT_CHARACTERISTIC(PROGRAMMABLE_SWITCH_EVENT, 0)),
+        NEW_HOMEKIT_CHARACTERISTIC(NAME, buttonInfo[i].name),
         NULL
       }
     );
   }
+
   *(s++) = NULL;  // Terminate the list of services
 
   accessories[0] = NEW_HOMEKIT_ACCESSORY(
+    .id=1,
     .category=homekit_accessory_category_other,
     .services=services);
   accessories[1] = NULL;  // Terminate the list of accessories
 }
 
-/*------------------------------------------------------------------------------
- *
- * Setup
- *
- *----------------------------------------------------------------------------*/
-
 void user_init(void) {
-  uart_set_baud(0, 115200);
+  prepLogging();
+  prepLED(Pin_LED, false);
 
-  prepLED();
-
-  printf("DeviceSetupID = %s\n", DeviceSetupID);
-  printf("DevicePassword = %s\n", DevicePassword);
-  printf("DeviceSerial = %s\n", DeviceSerial);
-  printf("DeviceName = %s\n", DeviceName);
+  setLEDColor(LED_GRAY);
+  printf("DeviceSetupID = %s\n", config.setupId);
+  printf("DevicePassword = %s\n", config.password);
+  printf("DeviceSerial = %s\n", QUOTE(DEV_SERIAL));
   buildAccessory();
 
-  wifi_config_init2(DeviceModel, NULL, handleWiFiEvent);
-
-  button_config_t button_config = BUTTON_CONFIG(button_active_low,  .max_repeat_presses=2);
-  for (int i = 0; i < NButtonPairs; i++) {
-    button_config.long_press_time = 2000;
-    if (button_create(button[i].onPin, button_config, onButtonCallback, &buttonEvent[i])) {
-        printf("Failed to initialize on button %d\n", i);
-    }
-    button_config.long_press_time = 8000;
-    if (button_create(button[i].offPin, button_config, offButtonCallback, &buttonEvent[i])) {
-        printf("Failed to initialize off button %d\n", i);
+  button_config_t button_config = BUTTON_CONFIG(button_active_low, .long_press_time=LongPressTime, .max_repeat_presses=3);
+  for (int i = 0; i < NButtons; i++) {
+    if (button_create(buttonInfo[i].pin, button_config, buttonCallback, &buttonInfo[i].event[i])) {
+        printf("Failed to initialize button %d\n", i);
     }
   }
+
+  wifi_config_init2(DeviceModel, NULL, handleWiFiEvent);
 }
