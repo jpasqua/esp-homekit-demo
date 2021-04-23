@@ -9,7 +9,7 @@ EXTRA_COMPONENTS = \
 	$(abspath ../../components/common/wolfssl) \
 	$(abspath ../../components/common/homekit)
 
-FLASH_SIZE ?= 4
+FLASH_SIZE ?= 32
 
 EXTRA_CFLAGS += -I../.. -DHOMEKIT_SHORT_APPLE_UUIDS \
 				-DDEV_SERIAL=$(DEV_SERIAL)			\
